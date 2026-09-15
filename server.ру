@@ -1,0 +1,102 @@
+"""Веб-сервер для приёма заявок с сайта + Telegram-бот."""
+import os, sys, logging, threading, time
+import requests
+from flask import Flask, request, jsonify
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from menu_generator import generate_calorie_plan, generate_budget_plan, format_telegram_message
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("ration-bot")
+app = Flask(__name__)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+USER_CACHE = {}
+USER_CACHE_LOCK = threading.Lock()
+
+def api_call(method, payload=None):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload or {}, timeout=10)
+        return r.json() if r.status_code == 200 else None
+    except Exception: return None
+
+def send_telegram(chat_id, text):
+    res = api_call("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+    return res is not None and res.get("ok")
+
+def lookup_user(username):
+    if not username: return None
+    with USER_CACHE_LOCK: return USER_CACHE.get(username.lstrip("@").lower())
+
+def cache_user(username, chat_id):
+    if username and chat_id:
+        with USER_CACHE_LOCK: USER_CACHE[username.lower()] = chat_id
+
+def handle_command(chat_id, text):
+    if text.startswith("/start"):
+        send_telegram(chat_id, "Привет! 👋 Бот «Индивидуальный рацион».\n\n📋 Собери меню: https://site-bb0.p.spru.io/\nКоманды: /test /menu /help")
+    elif text.startswith("/test"):
+        r = generate_calorie_plan({"family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":2,"budget":2000,"allergens":[],"dislikes":[]})
+        send_telegram(chat_id, format_telegram_message(r))
+    elif text.startswith("/menu"):
+        r = generate_calorie_plan({"family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":1,"budget":None,"allergens":[],"dislikes":[]})
+        send_telegram(chat_id, format_telegram_message(r))
+    elif text.startswith("/help"):
+        send_telegram(chat_id, "1. Заполни форму на https://site-bb0.p.spru.io/\n2. Укажи @username\n3. Получи меню здесь")
+    elif text:
+        send_telegram(chat_id, "Напиши /start, /test или /menu")
+
+def polling_loop():
+    log.info("Polling started")
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30, "allowed_updates": ["message"]}
+            if offset is not None: params["offset"] = offset
+            r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params=params, timeout=35)
+            if r.status_code != 200: time.sleep(3); continue
+            for upd in r.json().get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message")
+                if not msg: continue
+                chat_id = msg["chat"]["id"]
+                username = msg.get("from", {}).get("username", "")
+                text = (msg.get("text") or "").strip()
+                if username: cache_user(username, chat_id)
+                handle_command(chat_id, text)
+        except requests.exceptions.Timeout: continue
+        except Exception as e:
+            log.error(f"poll: {e}"); time.sleep(3)
+
+def parse_calorie_request(form):
+    family_size = int(form.get("family_size", 1) or 1)
+    persons = []
+    for i in range(family_size):
+        persons.append({"kcal": form.get(f"person_{i}_kcal") or "1500", "meals": form.get(f"person_{i}_meals") or "5"})
+    allergens = form.getlist("allergens") if hasattr(form, "getlist") else form.get("allergens", "")
+    return {"family_size":family_size,"persons":persons,"days":int(form.get("days",7)),"budget":int(form.get("budget_value") or 0) or None,"allergens":[a for a in (allergens if isinstance(allergens,list) else [allergens]) if a],"dislikes":[x.strip() for x in (form.get("dislike","") or "").split(",") if x.strip()],"telegram":form.get("telegram","")}
+
+def parse_budget_request(form):
+    meal_types = form.getlist("meal_types") if hasattr(form, "getlist") else form.get("meal_types", [])
+    excludes = form.getlist("exclude") if hasattr(form, "getlist") else form.get("exclude", [])
+    return {"meal_types":meal_types if isinstance(meal_types,list) else [meal_types],"budget":int(form.get("budget_value") or form.get("budget") or 5000),"people":form.get("people","1"),"days_b":int(form.get("days_b",7)),"excludes":[e for e in (excludes if isinstance(excludes,list) else [excludes]) if e],"telegram":form.get("telegram_b") or form.get("telegram","")}
+
+@app.route("/health")
+def health():
+    return jsonify({"status":"ok","bot":bool(BOT_TOKEN),"users":len(USER_CACHE)})
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    form = request.form
+    is_budget = form.get("mode") == "budget"
+    req = parse_budget_request(form) if is_budget else parse_calorie_request(form)
+    result = generate_budget_plan(req) if is_budget else generate_calorie_plan(req)
+    sent = False
+    tg = req.get("telegram","")
+    if tg and "error" not in result:
+        cid = lookup_user(tg)
+        if cid: sent = send_telegram(cid, format_telegram_message(result))
+    result["sent_to_telegram"] = sent
+    return jsonify(result)
+
+if __name__ == "__main__":
+    if BOT_TOKEN:
+        threading.Thread(target=polling_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False, use_reloader=False)
