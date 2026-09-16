@@ -1,4 +1,6 @@
-"""Webhook-сервер: приём заявок с сайта + Telegram bot. v2 — text command 'ещё' for reroll."""
+"""Webhook-сервер: приём заявок с сайта + Telegram bot + подписки.
+v3 — добавил полу-автоматическую подписку через СБП-сбор.
+"""
 import os, sys, logging, json, time, threading
 import requests
 from flask import Flask, request, jsonify
@@ -22,21 +24,29 @@ def all_exceptions(e):
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://ration-bot-production.up.railway.app")
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.json")
+PAYMENT_LINK = os.environ.get("PAYMENT_LINK", "https://www.tbank.ru/cf/4Mn3682YClc")
+PAYMENT_PRICE_RUB = int(os.environ.get("PAYMENT_PRICE_RUB", "300"))
+ACCESS_DAYS = int(os.environ.get("ACCESS_DAYS", "30"))
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "1002816812"))
+
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(DATA_DIR, "bot_state.json")
+ACCESS_FILE = os.path.join(DATA_DIR, "access.json")
+
 USER_CACHE = {}        # username.lower() -> chat_id
 LAST_REQ = {}          # chat_id -> last req dict (с учётом exclude_ids от reroll)
-LAST_PLAN = {}         # chat_id -> последний план (для возможного отображения)
+LAST_PLAN = {}         # chat_id -> последний план
+ACCESS = {}            # chat_id -> {"expiry": ts, "started_at": ts, "username": str}
 
 
 def _load_state():
-    """Загрузить кэш из файла (переживает рестарты)."""
+    """Загрузить кэш пользователей из файла (переживает рестарты)."""
     global USER_CACHE, LAST_REQ, LAST_PLAN
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
             USER_CACHE = d.get("users", {})
-            # LAST_REQ/LAST_PLAN ключи должны быть str(chat_id)
             LAST_REQ = {int(k): v for k, v in d.get("last_req", {}).items()}
             LAST_PLAN = {int(k): v for k, v in d.get("last_plan", {}).items()}
             log.info(f"State loaded: users={len(USER_CACHE)}, plans={len(LAST_PLAN)}")
@@ -45,7 +55,7 @@ def _load_state():
 
 
 def _save_state():
-    """Сохранить кэш в файл (атомарно)."""
+    """Сохранить кэш пользователей в файл (атомарно)."""
     try:
         d = {
             "users": USER_CACHE,
@@ -60,7 +70,53 @@ def _save_state():
         log.error(f"save_state failed: {e}")
 
 
+def _load_access():
+    """Загрузить подписки из файла."""
+    global ACCESS
+    try:
+        if os.path.exists(ACCESS_FILE):
+            with open(ACCESS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            ACCESS = {int(k): v for k, v in d.items()}
+            log.info(f"Access loaded: {len(ACCESS)} active subs")
+    except Exception as e:
+        log.error(f"load_access failed: {e}")
+
+
+def _save_access():
+    """Сохранить подписки в файл (атомарно)."""
+    try:
+        d = {str(k): v for k, v in ACCESS.items()}
+        tmp = ACCESS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, ACCESS_FILE)
+    except Exception as e:
+        log.error(f"save_access failed: {e}")
+
+
+def has_access(chat_id):
+    """Проверить, есть ли у пользователя активная подписка."""
+    if not ACCESS or chat_id not in ACCESS:
+        return False
+    return ACCESS[chat_id].get("expiry", 0) > time.time()
+
+
+def grant_access(chat_id, days, username=""):
+    """Выдать доступ на N дней."""
+    now = time.time()
+    ACCESS[chat_id] = {
+        "expiry": now + days * 86400,
+        "started_at": now,
+        "username": username,
+        "days": days,
+    }
+    _save_access()
+    log.info(f"Access granted to chat_id={chat_id} ({username}) for {days} days")
+
+
 _load_state()
+_load_access()
 
 
 def send_telegram(chat_id, text, reply_markup=None):
@@ -76,6 +132,33 @@ def send_telegram(chat_id, text, reply_markup=None):
         return r.status_code == 200
     except Exception as e:
         log.error(f"send error: {e}")
+        return False
+
+
+def send_invoice(chat_id):
+    """Отправить invoice для оплаты через Telegram Stars (если доступно)."""
+    try:
+        title = "Подписка на персональные меню"
+        description = f"Доступ к генерации персональных меню на {ACCESS_DAYS} дней"
+        payload = f"sub_{chat_id}_{int(time.time())}"
+        prices = [{"label": f"Подписка {ACCESS_DAYS} дней", "amount": PAYMENT_PRICE_RUB * 100}]  # в копейках
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendInvoice",
+            json={
+                "chat_id": chat_id,
+                "title": title,
+                "description": description,
+                "payload": payload,
+                "provider_token": "",  # пустой = Telegram Stars
+                "currency": "RUB",
+                "prices": prices,
+            },
+            timeout=10
+        )
+        log.info(f"sendInvoice: {r.json()}")
+        return r.status_code == 200
+    except Exception as e:
+        log.error(f"sendInvoice error: {e}")
         return False
 
 
@@ -102,14 +185,9 @@ def cache_user(username, chat_id):
         _save_state()
 
 
-def reroll_keyboard():
-    return {"inline_keyboard": [[{"text": "🔄 Другие блюда", "callback_data": "reroll"}]]}
-
-
 def reroll_reply_keyboard():
-    """Обычная клавиатура внизу чата — видна всегда, в отличие от inline."""
     return {
-        "keyboard": [[{"text": "🔄 Другие блюда"}]],
+        "keyboard": [[{"text": "🔄 Другие блюда"}, {"text": "💳 Подписка"}]],
         "resize_keyboard": True,
         "one_time_keyboard": False,
         "is_persistent": True,
@@ -130,16 +208,29 @@ def generate_and_send(chat_id, req, add_reroll=True):
     if "error" in plan:
         send_telegram(chat_id, f"⚠️ {plan['error']}")
         return plan
-    # длинное меню
     send_telegram(chat_id, format_telegram_message(plan), reply_markup=None)
-    # подсказка как получить новые блюда — текстом (не кнопкой)
     if add_reroll:
         send_telegram(
             chat_id,
-            "📝 Чтобы получить другие блюда — напиши сюда слово «ещё»\n"
-            "(или команду /reroll)",
+            "📝 Напиши «ещё» — пришлю другие блюда\n"
+            "💳 «Подписка» — информация о доступе",
         )
     return plan
+
+
+def paywall_message(chat_id, telegram_username=""):
+    """Сообщение для пользователей без подписки."""
+    msg = (
+        f"🔒 *Доступ закрыт*\n\n"
+        f"Чтобы получать персональные меню, оформи подписку:\n"
+        f"💰 *{PAYMENT_PRICE_RUB} ₽* — доступ на *{ACCESS_DAYS} дней*\n\n"
+        f"📲 *Шаг 1.* Оплати по ссылке:\n"
+        f"{PAYMENT_LINK}\n\n"
+        f"📲 *Шаг 2.* Вернись сюда и напиши *«оплатила»* (или /paid)\n\n"
+        f"✅ Доступ откроется автоматически.\n\n"
+        f"_Подписка действует {ACCESS_DAYS} дней. Можно продлить в любой момент._"
+    )
+    send_telegram(chat_id, msg)
 
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
@@ -155,7 +246,6 @@ def webhook():
         if data == "reroll" and chat_id in LAST_REQ:
             answer_callback(cb_id, "Готовлю другие варианты…")
             req = dict(LAST_REQ[chat_id])
-            # добираем exclude_ids из прошлого плана
             old_excl = set(req.get("exclude_ids") or [])
             if chat_id in LAST_PLAN:
                 old_excl |= set(_collect_dish_ids(LAST_PLAN[chat_id]))
@@ -165,8 +255,21 @@ def webhook():
             if "error" not in plan:
                 LAST_PLAN[chat_id] = plan
                 _save_state()
+        elif data == "buy":
+            answer_callback(cb_id, "Открываю ссылку на оплату…")
+            paywall_message(chat_id)
+        elif data == "paid":
+            if not has_access(chat_id):
+                # Выдаём доступ автоматически (semi-automatic)
+                grant_access(chat_id, ACCESS_DAYS)
+                answer_callback(cb_id, f"✅ Доступ открыт на {ACCESS_DAYS} дней!", show_alert=True)
+                send_telegram(chat_id, f"🎉 *Готово!* Подписка активна до *{time.strftime('%d.%m.%Y', time.localtime(ACCESS[chat_id]['expiry']))}*\n\nТеперь можешь заполнить форму на https://site-bb0.p.spru.io/ и получить меню прямо сюда 💌")
+                # уведомляем админа
+                send_telegram(ADMIN_CHAT_ID, f"💰 Новая подписка: chat_id={chat_id}, до {time.strftime('%d.%m.%Y %H:%M', time.localtime(ACCESS[chat_id]['expiry']))}")
+            else:
+                answer_callback(cb_id, f"Подписка уже активна до {time.strftime('%d.%m.%Y', time.localtime(ACCESS[chat_id]['expiry']))}", show_alert=True)
         else:
-            answer_callback(cb_id, "Нет предыдущего плана — заполни форму на сайте и получи меню")
+            answer_callback(cb_id, "Неизвестная команда")
         return jsonify({"ok": True})
 
     msg = upd.get("message")
@@ -179,23 +282,164 @@ def webhook():
         cache_user(username, chat_id)
     log.info(f"msg from @{username} ({chat_id}): {text}")
 
+    text_lower = text.lower()
+
     if text.startswith("/start"):
-        send_telegram(chat_id, "Привет! 👋 Бот «Индивидуальный рацион».\n\n📋 Собери меню на сайте: https://site-bb0.p.spru.io/\nКоманды: /test /menu /help")
-        send_telegram(chat_id, "Готово 👍", reply_markup=reroll_reply_keyboard())
+        # приветствие + проверка подписки
+        if has_access(chat_id):
+            expiry_str = time.strftime('%d.%m.%Y', time.localtime(ACCESS[chat_id]['expiry']))
+            send_telegram(
+                chat_id,
+                f"👋 С возвращением! Подписка активна до *{expiry_str}*\n\n"
+                f"📋 Собери меню на https://site-bb0.p.spru.io/\n"
+                f"Укажи свой @username, и меню придёт прямо сюда.\n\n"
+                f"Команды: /test /menu /help /paid",
+                reply_markup=reroll_reply_keyboard()
+            )
+        else:
+            send_telegram(
+                chat_id,
+                f"Привет! 👋 Бот «Индивидуальный рацион».\n\n"
+                f"🔒 Чтобы получить меню, оформи подписку: *{PAYMENT_PRICE_RUB} ₽* на *{ACCESS_DAYS} дней*.\n\n"
+                f"📲 [Оплатить]({PAYMENT_LINK})\n"
+                f"После оплаты напиши *«оплатила»* или нажми /paid",
+                reply_markup=reroll_reply_keyboard()
+            )
+            paywall_message(chat_id)
+
+    elif text.startswith("/paid") or text_lower in ("оплатила", "оплатил", "я оплатила", "я оплатил", "оплачено", "готово"):
+        if not has_access(chat_id):
+            grant_access(chat_id, ACCESS_DAYS, username)
+            expiry_str = time.strftime('%d.%m.%Y', time.localtime(ACCESS[chat_id]['expiry']))
+            send_telegram(
+                chat_id,
+                f"✅ *Доступ открыт на {ACCESS_DAYS} дней!*\n"
+                f"Действует до *{expiry_str}*\n\n"
+                f"Теперь заполни форму на https://site-bb0.p.spru.io/ "
+                f"и укажи свой @username — меню придёт сюда 💌",
+            )
+            send_telegram(
+                ADMIN_CHAT_ID,
+                f"💰 Новая подписка: @{username} (chat_id={chat_id}), "
+                f"до {expiry_str}",
+            )
+        else:
+            expiry_str = time.strftime('%d.%m.%Y', time.localtime(ACCESS[chat_id]['expiry']))
+            send_telegram(chat_id, f"Подписка уже активна до *{expiry_str}* ✅")
+
     elif text.startswith("/test"):
-        # Демо-план. НЕ сохраняем в LAST_REQ, чтобы не затирать реальные параметры пользователя.
+        if not has_access(chat_id):
+            paywall_message(chat_id)
+            return jsonify({"ok": True})
         req = {"_mode":"calorie","family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":2,"budget":2000,"allergens":[],"dislikes":[]}
         plan = generate_and_send(chat_id, req, add_reroll=True)
-        # НЕ перезаписываем LAST_REQ
+
     elif text.startswith("/menu"):
-        # Демо-план на 1 день. НЕ сохраняем в LAST_REQ.
+        if not has_access(chat_id):
+            paywall_message(chat_id)
+            return jsonify({"ok": True})
         req = {"_mode":"calorie","family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":1,"budget":None,"allergens":[],"dislikes":[]}
         plan = generate_and_send(chat_id, req, add_reroll=True)
-        # НЕ перезаписываем LAST_REQ
+
     elif text.startswith("/help"):
-        send_telegram(chat_id, "1. Заполни форму на https://site-bb0.p.spru.io/\n2. Укажи свой @username\n3. Получи меню в Telegram\n4. Нажми 🔄 Другие блюда внизу чата, если хочешь новые варианты")
-    elif text in ("🔄 Другие блюда", "🔄 Другие блюда ", "Другие блюда", "ещё", "еще", "Ещё", "Еще", "новые", "другие", "reroll", "/reroll"):
-        # текстовая команда для новых блюд — отвечаем сразу, генерим в фоне
+        send_telegram(chat_id, (
+            "📖 *Как пользоваться:*\n\n"
+            "1️⃣ Оформи подписку: /paid (или «оплатила»)\n"
+            "2️⃣ Заполни форму на https://site-bb0.p.spru.io/\n"
+            "3️⃣ В форме укажи свой @username из Telegram\n"
+            "4️⃣ Меню придёт прямо в этот чат\n"
+            "5️⃣ Напиши «ещё» — пришлю другие варианты блюд\n\n"
+            f"💳 Подписка: *{PAYMENT_PRICE_RUB} ₽* / {ACCESS_DAYS} дней\n"
+            f"🔗 Ссылка для оплаты: {PAYMENT_LINK}"
+        ))
+
+    elif text.startswith("/status"):
+        # показать статус подписки (админ видит любого по chat_id)
+        if chat_id == ADMIN_CHAT_ID and len(text.split()) > 1:
+            try:
+                target_cid = int(text.split()[1])
+                if has_access(target_cid):
+                    exp = time.strftime('%d.%m.%Y', time.localtime(ACCESS[target_cid]['expiry']))
+                    send_telegram(chat_id, f"chat_id={target_cid}: подписка до {exp}")
+                else:
+                    send_telegram(chat_id, f"chat_id={target_cid}: нет подписки")
+            except Exception:
+                send_telegram(chat_id, "❌ Некорректный chat_id")
+        elif has_access(chat_id):
+            exp = time.strftime('%d.%m.%Y', time.localtime(ACCESS[chat_id]['expiry']))
+            send_telegram(chat_id, f"✅ Подписка активна до *{exp}*")
+        else:
+            send_telegram(chat_id, "❌ Нет активной подписки")
+
+    elif text.startswith("/grant"):
+        # /grant <chat_id> <days> — только для админа
+        if chat_id != ADMIN_CHAT_ID:
+            send_telegram(chat_id, "⛔ Только для администратора")
+        else:
+            parts = text.split()
+            if len(parts) >= 3:
+                try:
+                    target_cid = int(parts[1])
+                    days = int(parts[2])
+                    grant_access(target_cid, days, username=f"manual_by_admin")
+                    send_telegram(chat_id, f"✅ Доступ выдан chat_id={target_cid} на {days} дней")
+                except ValueError:
+                    send_telegram(chat_id, "❌ Формат: /grant <chat_id> <days>")
+            else:
+                send_telegram(chat_id, "❌ Формат: /grant <chat_id> <days>")
+
+    elif text.startswith("/revoke"):
+        # /revoke <chat_id> — только для админа
+        if chat_id != ADMIN_CHAT_ID:
+            send_telegram(chat_id, "⛔ Только для администратора")
+        else:
+            parts = text.split()
+            if len(parts) >= 2:
+                try:
+                    target_cid = int(parts[1])
+                    if target_cid in ACCESS:
+                        del ACCESS[target_cid]
+                        _save_access()
+                        send_telegram(chat_id, f"🚫 Подписка chat_id={target_cid} отменена")
+                    else:
+                        send_telegram(chat_id, "Нет такой подписки")
+                except ValueError:
+                    send_telegram(chat_id, "❌ Формат: /revoke <chat_id>")
+            else:
+                send_telegram(chat_id, "❌ Формат: /revoke <chat_id>")
+
+    elif text.startswith("/subs"):
+        # /subs — список всех подписок (только админ)
+        if chat_id != ADMIN_CHAT_ID:
+            send_telegram(chat_id, "⛔ Только для администратора")
+        else:
+            now = time.time()
+            active = []
+            expired = 0
+            for cid, info in ACCESS.items():
+                if info.get("expiry", 0) > now:
+                    exp = time.strftime('%d.%m.%Y', time.localtime(info['expiry']))
+                    active.append(f"  • {cid} (@{info.get('username','?')}) — до {exp}")
+                else:
+                    expired += 1
+            text_msg = f"📊 *Подписки:* {len(active)} активных, {expired} истекших\n\n"
+            text_msg += "\n".join(active[:30]) if active else "_Нет активных_"
+            if len(active) > 30:
+                text_msg += f"\n_...и ещё {len(active) - 30}_"
+            send_telegram(chat_id, text_msg)
+
+    elif text.startswith("/invoices"):
+        # /invoices — статистика (только админ)
+        if chat_id == ADMIN_CHAT_ID:
+            send_telegram(chat_id, "ℹ️ Платёжная ссылка: " + PAYMENT_LINK)
+
+    elif text in ("💳 Подписка", "Подписка", "оплатить", "Оплатить"):
+        paywall_message(chat_id)
+
+    elif text in ("🔄 Другие блюда", "другие блюда"):
+        if not has_access(chat_id):
+            paywall_message(chat_id)
+            return jsonify({"ok": True})
         if chat_id in LAST_REQ:
             send_telegram(chat_id, "🌟 Готовлю другие варианты…")
             req = dict(LAST_REQ[chat_id])
@@ -214,12 +458,43 @@ def webhook():
                 except Exception as e:
                     log.exception("reroll failed: %s", e)
                     send_telegram(chat_id, "⚠️ Не получилось собрать другие блюда. Попробуй ещё раз.")
-
             threading.Thread(target=_do_reroll, daemon=True).start()
         else:
             send_telegram(chat_id, "Нет предыдущего плана — заполни форму на https://site-bb0.p.spru.io/")
+
+    elif text_lower in ("ещё", "еще", "новые", "другие", "reroll", "/reroll"):
+        if not has_access(chat_id):
+            paywall_message(chat_id)
+            return jsonify({"ok": True})
+        if chat_id in LAST_REQ:
+            send_telegram(chat_id, "🌟 Готовлю другие варианты…")
+            req = dict(LAST_REQ[chat_id])
+            old_excl = set(req.get("exclude_ids") or [])
+            if chat_id in LAST_PLAN:
+                old_excl |= set(_collect_dish_ids(LAST_PLAN[chat_id]))
+            req["exclude_ids"] = list(old_excl)
+            LAST_REQ[chat_id] = req
+
+            def _do_reroll(chat_id=chat_id, req=req):
+                try:
+                    plan = generate_and_send(chat_id, req, add_reroll=True)
+                    if "error" not in plan:
+                        LAST_PLAN[chat_id] = plan
+                        _save_state()
+                except Exception as e:
+                    log.exception("reroll failed: %s", e)
+                    send_telegram(chat_id, "⚠️ Не получилось собрать другие блюда. Попробуй ещё раз.")
+            threading.Thread(target=_do_reroll, daemon=True).start()
+        else:
+            send_telegram(chat_id, "Нет предыдущего плана — заполни форму на https://site-bb0.p.spru.io/")
+
     elif text:
-        send_telegram(chat_id, "Напиши «ещё» для новых блюд\nИли /start /test /menu")
+        # любой другой текст — если нет подписки, объясняем что к чему
+        if not has_access(chat_id):
+            paywall_message(chat_id)
+        else:
+            send_telegram(chat_id, "Напиши «ещё» для новых блюд\nИли /start /test /menu /help")
+
     return jsonify({"ok": True})
 
 
@@ -258,7 +533,17 @@ def parse_budget_request(form):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "bot": bool(BOT_TOKEN), "users": len(USER_CACHE), "plans": len(LAST_PLAN)})
+    now = time.time()
+    active_subs = sum(1 for v in ACCESS.values() if v.get("expiry", 0) > now)
+    return jsonify({
+        "status": "ok",
+        "bot": bool(BOT_TOKEN),
+        "users": len(USER_CACHE),
+        "plans": len(LAST_PLAN),
+        "subs": active_subs,
+        "price_rub": PAYMENT_PRICE_RUB,
+        "access_days": ACCESS_DAYS,
+    })
 
 
 @app.route("/generate", methods=["POST"])
@@ -269,23 +554,37 @@ def generate():
         req = parse_budget_request(form) if is_budget else parse_calorie_request(form)
         plan = generate_budget_plan(req) if is_budget else generate_calorie_plan(req)
         sent = False
+        no_access = False
         tg = req.get("telegram", "")
         if tg and "error" not in plan:
             cid = lookup_user(tg)
             if cid:
-                sent = send_telegram(cid, format_telegram_message(plan), reply_markup=None)
-                send_telegram(
-                    cid,
-                    "📝 Чтобы получить другие блюда — напиши сюда слово «ещё»\n"
-                    "(или команду /reroll)",
-                )
-                LAST_REQ[cid] = req
-                LAST_PLAN[cid] = plan
-                _save_state()
-                log.info(f"Sent to {tg} (chat_id={cid}): {sent}")
+                if has_access(cid):
+                    sent = send_telegram(cid, format_telegram_message(plan), reply_markup=None)
+                    send_telegram(
+                        cid,
+                        "📝 Напиши «ещё» — пришлю другие блюда\n"
+                        "💳 «Подписка» — информация о доступе",
+                    )
+                    LAST_REQ[cid] = req
+                    LAST_PLAN[cid] = plan
+                    _save_state()
+                    log.info(f"Sent to {tg} (chat_id={cid}): {sent}")
+                else:
+                    no_access = True
+                    log.warning(f"User {tg} (chat_id={cid}) tried to use bot without subscription")
+                    send_telegram(
+                        cid,
+                        f"🔒 *Подписка не активна.*\n\n"
+                        f"Меню готово, но чтобы получить его, оплати доступ:\n"
+                        f"{PAYMENT_LINK}\n\n"
+                        f"После оплаты напиши *«оплатила»* или /paid — и меню придёт автоматически ✨",
+                    )
             else:
                 log.warning(f"User {tg} not in cache — must /start the bot first")
         plan["sent_to_telegram"] = sent
+        plan["no_access"] = no_access
+        plan["payment_link"] = PAYMENT_LINK if no_access else None
         return jsonify(plan)
     except Exception as e:
         import traceback
