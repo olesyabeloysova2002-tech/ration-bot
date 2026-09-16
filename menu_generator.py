@@ -28,28 +28,41 @@ def _score_dish(dish, target_kcal, recently_used_ids, cost_weight=0.0):
     return kcal_score + variety_score + cost_score
 
 
+SLOT_WEIGHTS = {
+    "завтрак": 0.85,   # 1800 → 510 на завтрак
+    "обед":    1.30,   # 1800 → 780 на обед
+    "ужин":    0.95,   # 1800 → 570 на ужин
+    "перекус": 0.20,   # 1800 → 120 на перекус
+}
+
+
 def _generate_day_menu(person_kcal, meals_per_day, allergens, dislikes, recently_used):
     """Сгенерировать меню на один день для одного человека."""
     slots = MEAL_SLOTS.get(meals_per_day, MEAL_SLOTS[3])
-    target_per_meal = person_kcal / len(slots)
-    # Если есть перекусы — выделяем на них меньше калорий
-    snack_kcal_factor = 0.8
-    main_kcal_factor = 1.1
+    total_weight = sum(SLOT_WEIGHTS.get(s, 1.0) for s in slots)
+    # нормируем веса так, чтобы сумма target'ов = person_kcal
+    norm = person_kcal / total_weight if total_weight > 0 else person_kcal / len(slots)
 
     day_menu = []
     for slot in slots:
         candidates = filter_safe(get_by_meal_type(slot), allergens=allergens, dislikes=dislikes)
         if not candidates:
-            return None  # не получилось собрать меню
-        target = target_per_meal
-        if slot == "перекус":
-            target *= snack_kcal_factor
-        else:
-            target *= main_kcal_factor
+            return None
+        target = norm * SLOT_WEIGHTS.get(slot, 1.0)
         # подбираем лучшее
         best = max(candidates, key=lambda d: _score_dish(d, target, recently_used))
         day_menu.append({"slot": slot, "dish": best})
         recently_used.add(best["id"])
+
+    # Если итог < target - 8% — добавляем перекус
+    total = sum(m["dish"]["kcal"] for m in day_menu)
+    if total < person_kcal * 0.92:
+        snacks = filter_safe(get_by_meal_type("перекус"), allergens=allergens, dislikes=dislikes)
+        if snacks and "перекус" not in slots:
+            # берём самый калорийный перекус, чтобы закрыть дельту
+            best_snack = max(snacks, key=lambda d: d["kcal"])
+            day_menu.append({"slot": "перекус", "dish": best_snack})
+            recently_used.add(best_snack["id"])
     return day_menu
 
 
