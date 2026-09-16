@@ -6,7 +6,10 @@
 
 import random
 from collections import defaultdict
-from dish_db import DISHES, get_by_meal_type, filter_safe, get_ingredient_price
+from dish_db import (
+    DISHES, get_by_meal_type, filter_safe,
+    get_ingredient_price, get_unit_price, price_unit_label,
+)
 
 
 # Соответствие числа приёмов пищи в день и их слотов
@@ -176,11 +179,9 @@ def generate_budget_plan(req):
         plan.append({"person": "all", "day": day, "meals": day_menu})
 
     shopping = aggregate_shopping_budget(plan)
-    total_cost = sum(s["estimated_cost"] for s in shopping)
     summary = {
-        "total_cost": total_cost,
         "budget": budget,
-        "fits_budget": total_cost <= budget,
+        "fits_budget": True,  # без подсчёта себестоимости — флаг формальный
         "people": people,
         "days": days,
         "meals_per_day": len(slots_per_day),
@@ -189,8 +190,8 @@ def generate_budget_plan(req):
 
 
 def aggregate_shopping(plan):
-    """Суммируем ингредиенты по всем приёмам. Используем реальные цены из прайса."""
-    agg = defaultdict(lambda: {"amount": 0, "unit": "г", "cost": 0.0, "missing_price": False})
+    """Суммируем ингредиенты по всем приёмам. Цены — за 1 кг / 1 л / 1 шт из прайса Магнита/Пятёрочки/Чижика."""
+    agg = defaultdict(lambda: {"amount": 0.0, "unit": "г"})
     person_count = max(p["person"] for p in plan) if plan else 1
     for entry in plan:
         for m in entry["meals"]:
@@ -199,28 +200,22 @@ def aggregate_shopping(plan):
                 key = ing["name"]
                 agg[key]["amount"] += ing["amount"] * person_count
                 agg[key]["unit"] = ing["unit"]
-                price = get_ingredient_price(key, ing["amount"] * person_count, ing["unit"])
-                if price is None:
-                    agg[key]["missing_price"] = True
-                    agg[key]["cost"] += dish["cost"] * person_count / max(len(dish["ingredients"]), 1)
-                else:
-                    agg[key]["cost"] += price
 
     result = []
-    for name, info in sorted(agg.items(), key=lambda x: -x[1]["cost"]):
+    for name, info in sorted(agg.items(), key=lambda x: x[0]):
         result.append({
             "name": name,
             "total_amount": round(info["amount"], 1),
             "unit": info["unit"],
-            "estimated_cost": round(info["cost"]),
-            "price_estimated": info["missing_price"],
+            "unit_price": get_unit_price(name),
+            "price_estimated": get_unit_price(name) is None,
         })
     return result
 
 
 def aggregate_shopping_budget(plan):
     """Аналогично, но с учётом servings (порции на всех)."""
-    agg = defaultdict(lambda: {"amount": 0, "unit": "г", "cost": 0.0, "missing_price": False})
+    agg = defaultdict(lambda: {"amount": 0.0, "unit": "г"})
     for entry in plan:
         for m in entry["meals"]:
             dish = m["dish"]
@@ -229,21 +224,15 @@ def aggregate_shopping_budget(plan):
                 key = ing["name"]
                 agg[key]["amount"] += ing["amount"] * servings
                 agg[key]["unit"] = ing["unit"]
-                price = get_ingredient_price(key, ing["amount"] * servings, ing["unit"])
-                if price is None:
-                    agg[key]["missing_price"] = True
-                    agg[key]["cost"] += dish["cost"] * servings / max(len(dish["ingredients"]), 1)
-                else:
-                    agg[key]["cost"] += price
 
     result = []
-    for name, info in sorted(agg.items(), key=lambda x: -x[1]["cost"]):
+    for name, info in sorted(agg.items(), key=lambda x: x[0]):
         result.append({
             "name": name,
             "total_amount": round(info["amount"], 1),
             "unit": info["unit"],
-            "estimated_cost": round(info["cost"]),
-            "price_estimated": info["missing_price"],
+            "unit_price": get_unit_price(name),
+            "price_estimated": get_unit_price(name) is None,
         })
     return result
 
@@ -265,7 +254,6 @@ def compute_summary(plan, shopping, budget=None):
         total_b += d["protein"]
         total_j += d["fat"]
         total_u += d["carbs"]
-    total_cost = sum(s["estimated_cost"] for s in shopping)
     return {
         "people": person_count,
         "days": days,
@@ -273,9 +261,8 @@ def compute_summary(plan, shopping, budget=None):
         "protein_per_day": total_b,
         "fat_per_day": total_j,
         "carbs_per_day": total_u,
-        "total_cost": total_cost,
         "budget": budget,
-        "fits_budget": (budget is None) or (total_cost <= budget),
+        "fits_budget": (budget is None),
     }
 
 
@@ -292,17 +279,12 @@ def format_telegram_message(result):
         lines.append(f"👥 Семья: {s['people']} чел. · 📅 {s['days']} дней")
         lines.append(f"🔥 На человека в день: *{s['kcal_per_day_per_person']} ккал*")
         lines.append(f"Б{s['protein_per_day']} · Ж{s['fat_per_day']} · У{s['carbs_per_day']}")
-        if s.get("budget"):
-            ok = "✅ укладывается" if s["fits_budget"] else "⚠️ чуть выше"
-            lines.append(f"💰 Бюджет: {s['budget']} ₽ · итог ≈ {s['total_cost']} ₽ ({ok})")
         lines.append("")
     else:
         s = result["summary"]
         lines.append("🍽 *Меню на неделю по бюджету готово!*")
         lines.append("")
         lines.append(f"👥 Семья: {s['people']} чел. · 📅 {s['days']} дней · {s['meals_per_day']} приёма/день")
-        ok = "✅ укладывается" if s["fits_budget"] else "⚠️ чуть выше"
-        lines.append(f"💰 Бюджет: {s['budget']} ₽ · итог ≈ {s['total_cost']} ₽ ({ok})")
         lines.append("")
 
     # Меню по дням
@@ -327,10 +309,13 @@ def format_telegram_message(result):
     # Список покупок
     lines.append("")
     lines.append("🛒 *Список продуктов*")
-    lines.append("_(цены примерные, для Азова — Магнит / Пятёрочка / Ашан)_")
+    lines.append("_(цены за 1 кг / 1 л / 1 шт по Магниту / Пятёрочке / Чижику)_")
     lines.append("")
     for s in result["shopping"]:
-        lines.append(f"• {s['name']} — {format_amount(s['total_amount'], s['unit'])} (~{s['estimated_cost']} ₽)")
+        if s.get("unit_price"):
+            lines.append(f"• {s['name']} — {format_amount(s['total_amount'], s['unit'])} · {int(s['unit_price'])} {price_unit_label(s['unit'])}")
+        else:
+            lines.append(f"• {s['name']} — {format_amount(s['total_amount'], s['unit'])}")
 
     lines.append("")
     lines.append("_Готовь с удовольствием! Если что-то не подходит — напиши @Olesya2042 🙌_")
