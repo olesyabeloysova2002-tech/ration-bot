@@ -116,8 +116,15 @@ def generate_and_send(chat_id, req, add_reroll=True):
     if "error" in plan:
         send_telegram(chat_id, f"⚠️ {plan['error']}")
         return plan
-    markup = reroll_keyboard() if add_reroll else None
-    send_telegram(chat_id, format_telegram_message(plan), reply_markup=markup)
+    # длинное меню — без кнопки (Telegram иногда прячет inline под длинным текстом)
+    send_telegram(chat_id, format_telegram_message(plan), reply_markup=None)
+    # кнопку шлём отдельным сообщением — её 100% видно
+    if add_reroll:
+        send_telegram(
+            chat_id,
+            "👇 Хочешь другие варианты блюд? Нажми кнопку:",
+            reply_markup=reroll_keyboard(),
+        )
     return plan
 
 
@@ -231,9 +238,14 @@ def generate():
         if tg and "error" not in plan:
             cid = lookup_user(tg)
             if cid:
-                # отправляем с кнопкой reroll
-                markup = reroll_keyboard()
-                sent = send_telegram(cid, format_telegram_message(plan), reply_markup=markup)
+                # длинное меню — без кнопки (Telegram прячет inline под длинным текстом)
+                sent = send_telegram(cid, format_telegram_message(plan), reply_markup=None)
+                # кнопку шлём отдельным сообщением
+                send_telegram(
+                    cid,
+                    "👇 Хочешь другие варианты блюд? Нажми кнопку:",
+                    reply_markup=reroll_keyboard(),
+                )
                 # сохраняем для reroll
                 LAST_REQ[cid] = req
                 LAST_PLAN[cid] = plan
