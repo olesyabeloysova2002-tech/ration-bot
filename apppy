@@ -1,5 +1,5 @@
 """Webhook-сервер: приём заявок с сайта + Telegram bot. v2 — text command 'ещё' for reroll."""
-import os, sys, logging, json, time
+import os, sys, logging, json, time, threading
 import requests
 from flask import Flask, request, jsonify
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -199,7 +199,7 @@ def webhook():
     elif text.startswith("/help"):
         send_telegram(chat_id, "1. Заполни форму на https://site-bb0.p.spru.io/\n2. Укажи свой @username\n3. Получи меню в Telegram\n4. Нажми 🔄 Другие блюда внизу чата, если хочешь новые варианты")
     elif text in ("🔄 Другие блюда", "🔄 Другие блюда ", "Другие блюда", "ещё", "еще", "Ещё", "Еще", "новые", "другие", "reroll", "/reroll"):
-        # текстовая команда для новых блюд (iOS не показывает inline/reply-клавиатуры у этого клиента)
+        # текстовая команда для новых блюд — отвечаем сразу, генерим в фоне
         if chat_id in LAST_REQ:
             send_telegram(chat_id, "🌟 Готовлю другие варианты…")
             req = dict(LAST_REQ[chat_id])
@@ -208,10 +208,18 @@ def webhook():
                 old_excl |= set(_collect_dish_ids(LAST_PLAN[chat_id]))
             req["exclude_ids"] = list(old_excl)
             LAST_REQ[chat_id] = req
-            plan = generate_and_send(chat_id, req, add_reroll=True)
-            if "error" not in plan:
-                LAST_PLAN[chat_id] = plan
-                _save_state()
+
+            def _do_reroll(chat_id=chat_id, req=req):
+                try:
+                    plan = generate_and_send(chat_id, req, add_reroll=True)
+                    if "error" not in plan:
+                        LAST_PLAN[chat_id] = plan
+                        _save_state()
+                except Exception as e:
+                    log.exception("reroll failed: %s", e)
+                    send_telegram(chat_id, "⚠️ Не получилось собрать другие блюда. Попробуй ещё раз.")
+
+            threading.Thread(target=_do_reroll, daemon=True).start()
         else:
             send_telegram(chat_id, "Нет предыдущего плана — заполни форму на https://site-bb0.p.spru.io/")
     elif text:
