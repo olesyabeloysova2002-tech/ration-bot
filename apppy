@@ -25,7 +25,7 @@ def all_exceptions(e):
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://ration-bot-production.up.railway.app")
 PAYMENT_LINK = os.environ.get("PAYMENT_LINK", "https://www.tbank.ru/cf/4Mn3682YClc")
-PAYMENT_PRICE_RUB = int(os.environ.get("PAYMENT_PRICE_RUB", "300"))
+PAYMENT_PRICE_RUB = int(os.environ.get("PAYMENT_PRICE_RUB", "499"))
 ACCESS_DAYS = int(os.environ.get("ACCESS_DAYS", "30"))
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "1002816812"))
 
