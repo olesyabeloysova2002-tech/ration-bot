@@ -8,6 +8,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("ration-bot")
 
 app = Flask(__name__)
+
+@app.errorhandler(Exception)
+def all_exceptions(e):
+    import traceback
+    log.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
+    return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://ration-bot-production.up.railway.app")
 USER_CACHE = {}
