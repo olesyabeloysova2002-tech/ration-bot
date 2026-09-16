@@ -183,19 +183,15 @@ def webhook():
         send_telegram(chat_id, "Привет! 👋 Бот «Индивидуальный рацион».\n\n📋 Собери меню на сайте: https://site-bb0.p.spru.io/\nКоманды: /test /menu /help")
         send_telegram(chat_id, "Готово 👍", reply_markup=reroll_reply_keyboard())
     elif text.startswith("/test"):
+        # Демо-план. НЕ сохраняем в LAST_REQ, чтобы не затирать реальные параметры пользователя.
         req = {"_mode":"calorie","family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":2,"budget":2000,"allergens":[],"dislikes":[]}
         plan = generate_and_send(chat_id, req, add_reroll=True)
-        if "error" not in plan:
-            LAST_REQ[chat_id] = req
-            LAST_PLAN[chat_id] = plan
-            _save_state()
+        # НЕ перезаписываем LAST_REQ
     elif text.startswith("/menu"):
+        # Демо-план на 1 день. НЕ сохраняем в LAST_REQ.
         req = {"_mode":"calorie","family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":1,"budget":None,"allergens":[],"dislikes":[]}
         plan = generate_and_send(chat_id, req, add_reroll=True)
-        if "error" not in plan:
-            LAST_REQ[chat_id] = req
-            LAST_PLAN[chat_id] = plan
-            _save_state()
+        # НЕ перезаписываем LAST_REQ
     elif text.startswith("/help"):
         send_telegram(chat_id, "1. Заполни форму на https://site-bb0.p.spru.io/\n2. Укажи свой @username\n3. Получи меню в Telegram\n4. Нажми 🔄 Другие блюда внизу чата, если хочешь новые варианты")
     elif text in ("🔄 Другие блюда", "🔄 Другие блюда ", "Другие блюда", "ещё", "еще", "Ещё", "Еще", "новые", "другие", "reroll", "/reroll"):
