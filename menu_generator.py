@@ -36,34 +36,51 @@ SLOT_WEIGHTS = {
 }
 
 
-def _generate_day_menu(person_kcal, meals_per_day, allergens, dislikes, recently_used):
+def _generate_day_menu(person_kcal, meals_per_day, allergens, dislikes, recently_used, exclude_ids=None):
     """Сгенерировать меню на один день для одного человека."""
     slots = MEAL_SLOTS.get(meals_per_day, MEAL_SLOTS[3])
     total_weight = sum(SLOT_WEIGHTS.get(s, 1.0) for s in slots)
-    # нормируем веса так, чтобы сумма target'ов = person_kcal
     norm = person_kcal / total_weight if total_weight > 0 else person_kcal / len(slots)
 
     day_menu = []
     for slot in slots:
-        candidates = filter_safe(get_by_meal_type(slot), allergens=allergens, dislikes=dislikes)
+        candidates = filter_safe(
+            get_by_meal_type(slot),
+            allergens=allergens,
+            dislikes=dislikes,
+            exclude_ids=exclude_ids,
+        )
         if not candidates:
             return None
         target = norm * SLOT_WEIGHTS.get(slot, 1.0)
-        # подбираем лучшее
         best = max(candidates, key=lambda d: _score_dish(d, target, recently_used))
         day_menu.append({"slot": slot, "dish": best})
         recently_used.add(best["id"])
 
-    # Если итог < target - 8% — добавляем перекус
     total = sum(m["dish"]["kcal"] for m in day_menu)
     if total < person_kcal * 0.92:
-        snacks = filter_safe(get_by_meal_type("перекус"), allergens=allergens, dislikes=dislikes)
+        snacks = filter_safe(
+            get_by_meal_type("перекус"),
+            allergens=allergens,
+            dislikes=dislikes,
+            exclude_ids=exclude_ids,
+        )
         if snacks and "перекус" not in slots:
-            # берём самый калорийный перекус, чтобы закрыть дельту
             best_snack = max(snacks, key=lambda d: d["kcal"])
             day_menu.append({"slot": "перекус", "dish": best_snack})
             recently_used.add(best_snack["id"])
     return day_menu
+
+
+def _collect_dish_ids(plan):
+    """Собрать все id блюд из плана."""
+    out = []
+    for entry in plan:
+        for m in entry.get("meals", []):
+            d = m.get("dish") or {}
+            if d.get("id"):
+                out.append(d["id"])
+    return out
 
 
 def generate_calorie_plan(req):
@@ -84,6 +101,7 @@ def generate_calorie_plan(req):
         budget = None
     allergens = req.get("allergens", [])
     dislikes = req.get("dislikes", [])
+    exclude_ids = set(req.get("exclude_ids") or [])
 
     plan = []
     recently_used = set()
@@ -97,6 +115,7 @@ def generate_calorie_plan(req):
                 allergens=allergens,
                 dislikes=dislikes,
                 recently_used=recently_used,
+                exclude_ids=exclude_ids,
             )
             if day_menu is None:
                 return {"error": f"Не удалось собрать меню: слишком жёсткие ограничения (аллергены/нелюбимое). Попробуй убрать часть ограничений."}
@@ -116,8 +135,8 @@ def generate_budget_plan(req):
     meal_types = req.get("meal_types", ["обед", "ужин"])
     excludes = req.get("excludes", [])
     other = req.get("exclude_other", "")
+    exclude_ids = set(req.get("exclude_ids") or [])
 
-    # Если человек несколько — порции масштабируем (на семью)
     people_n = int(people) if people != "5+" else 5
 
     plan = []
@@ -127,7 +146,11 @@ def generate_budget_plan(req):
     for day in range(1, days + 1):
         day_menu = []
         for slot in slots_per_day:
-            candidates = filter_safe(get_by_meal_type(slot), excludes=excludes)
+            candidates = filter_safe(
+                get_by_meal_type(slot),
+                excludes=excludes,
+                exclude_ids=exclude_ids,
+            )
             if not candidates:
                 return {"error": f"Нет блюд типа '{slot}' без исключений."}
             # Бюджетный режим: оптимизируем по цене и разнообразию
