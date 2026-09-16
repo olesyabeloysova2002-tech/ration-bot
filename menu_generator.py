@@ -78,7 +78,10 @@ def generate_calorie_plan(req):
         persons = [{"kcal": 1500, "meals": 5}]
     days = int(req.get("days", 7))
     _budget = req.get("budget")
-    budget = int(_budget) if _budget else None
+    try:
+        budget = int(_budget) if _budget else None
+    except (TypeError, ValueError):
+        budget = None
     allergens = req.get("allergens", [])
     dislikes = req.get("dislikes", [])
 
