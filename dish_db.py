@@ -13,6 +13,8 @@
   - tags: теги для подбора (быстро, вегетарианское, без_мяса)
 """
 
+import re
+
 # Цены за единицу (₽/кг для граммовых, ₽/л для мл, ₽/шт для штук)
 # Актуально для Азова, Магнит/Пятёрочка/Ашан, 2026
 INGREDIENT_PRICES = {
@@ -2179,24 +2181,88 @@ def get_by_meal_type(meal_type):
     return [d for d in DISHES if d["meal_type"] == meal_type]
 
 
+# Алиасы: id из формы → список имён в БД (allergens/ингредиентах), которые считаются "этим".
+# Если в чекбоксе формы стоит "морепродукты", а в БД блюдо помечено только "рыба" — всё равно отсекаем.
+ALLERGEN_ALIASES = {
+    "молоко":       ["молоко", "сливки", "масло сливочное", "сметана", "творог", "йогурт", "сыр", "кефир"],
+    "яйца":         ["яйца", "яйцо"],
+    "глютен":       ["глютен", "пшеница", "мука", "хлеб", "паста", "макароны", "булгур", "кускус", "овсянка", "блин", "сырник"],
+    "орехи":        ["орехи", "арахис", "миндаль", "грецкий", "фундук", "кешью", "фисташки"],
+    "рыба":         ["рыба", "лосось", "скумбрия", "треска", "тунец", "форель", "сельдь"],
+    "морепродукты": ["морепродукты", "рыба", "креветки", "мидии", "кальмар", "осьминог", "угорь", "раки"],
+    "соя":          ["соя"],
+    "грибы":        ["грибы", "шампиньон"],
+}
+
+# Алиасы для excludes — продукты, которые не хотим видеть (из budget-формы или свободный ввод)
+EXCLUDE_ALIASES = {
+    "свинина":  ["свинина", "свиная"],
+    "говядина": ["говядина", "говяжий", "телятина", "телятина"],
+    "курица":   ["курица", "куриная", "куриное", "куриный", "индейка", "индейки"],
+    "рыба":     ["рыба", "лосось", "скумбрия", "треска", "тунец", "форель", "сельдь"],
+    "грибы":    ["грибы", "шампиньон"],
+    "молоко":   ["молоко", "сливки", "масло сливочное", "сметана", "творог", "йогурт", "сыр", "кефир"],
+    "яйца":     ["яйца", "яйцо"],
+}
+
+# Фразы, которые юзеры добавляют в свободном вводе dislikes и которые надо выкинуть перед поиском.
+_DISLIKE_STOPWORDS = {"не", "люблю", "хочу", "ем", "нравится", "ненавижу", "не ем", "не хочу", "не люблю", "не нравится", "и", "и "}
+
+
+def _expand(key, alias_map):
+    """Возвращает set строк, по которым надо искать вхождение в allergens/ингредиентах."""
+    k = (key or "").lower().strip()
+    if not k:
+        return set()
+    if k in alias_map:
+        return set(alias_map[k])
+    # свободный ввод — ищем как есть + возможные варианты
+    return {k}
+
+
 def filter_safe(dishes, allergens=None, dislikes=None, excludes=None, exclude_ids=None):
-    """Убираем блюда с аллергенами, нелюбимыми или уже показанными."""
-    allergens = set(a.lower() for a in (allergens or []))
-    dislikes = [d.lower().strip() for d in (dislikes or []) if d.strip()]
-    excludes = [e.lower().strip() for e in (excludes or []) if e.strip()]
+    """Убираем блюда с аллергенами, нелюбимыми продуктами или уже показанными."""
     exclude_ids = set(exclude_ids or [])
 
+    # Соберём множества «запрещённых» имён.
+    banned_allergens = set()
+    for a in allergens or []:
+        banned_allergens |= _expand(a, ALLERGEN_ALIASES)
+
+    banned_excludes = set()
+    for e in excludes or []:
+        banned_excludes |= _expand(e, EXCLUDE_ALIASES)
+
+    # dislikes: текст из формы — почистим стоп-слова ("не люблю грибы" → "грибы"),
+    # оставшиеся слова ищем в ингредиентах как substring.
+    raw_dislikes = []
+    for d in dislikes or []:
+        s = (d or "").lower().strip()
+        if not s:
+            continue
+        words = [w for w in re.split(r"[ ,;]+", s) if w and w not in _DISLIKE_STOPWORDS]
+        raw_dislikes.extend(words)
+    raw_dislikes = [d for d in raw_dislikes if d]
+
     out = []
-    for d in dishes:
-        if d["id"] in exclude_ids:
+    for dish in dishes:
+        if dish["id"] in exclude_ids:
             continue
-        if any(a in allergens for a in d.get("allergens", [])):
+
+        dish_allergens = {a.lower() for a in dish.get("allergens", [])}
+        dish_ings_text = " ".join(i["name"].lower() for i in dish.get("ingredients", []))
+
+        # 1) Любой аллерген из формы (с учётом алиасов) — совпал с тегом блюда или с ингредиентом.
+        if any(a in dish_allergens or a in dish_ings_text for a in banned_allergens):
             continue
-        if any(e in d.get("tags", []) for e in excludes):
+
+        # 2) Excludes — ищем только в ингредиентах (теги в БД называются иначе).
+        if any(e in dish_ings_text for e in banned_excludes):
             continue
-        if dislikes:
-            ings = " ".join(i["name"].lower() for i in d["ingredients"])
-            if any(dis in ings for dis in dislikes):
-                continue
-        out.append(d)
+
+        # 3) Dislikes — подстрока в ингредиентах.
+        if raw_dislikes and any(dis in dish_ings_text for dis in raw_dislikes):
+            continue
+
+        out.append(dish)
     return out
