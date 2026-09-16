@@ -504,13 +504,17 @@ def parse_calorie_request(form):
     for i in range(family_size):
         persons.append({"kcal": form.get(f"person_{i}_kcal") or "1500", "meals": form.get(f"person_{i}_meals") or "5"})
     allergens = form.getlist("allergens") if hasattr(form, "getlist") else form.get("allergens", "")
+    if isinstance(allergens, str):
+        allergens = [allergens] if allergens else []
+    other_all = form.get("allergens_other", "") or ""
+    other_all = [x.strip() for x in other_all.split(",") if x.strip()]
     req = {
         "_mode": "calorie",
         "family_size": family_size,
         "persons": persons,
         "days": int(form.get("days", 7)),
         "budget": int(form.get("budget_value") or 0) or None,
-        "allergens": [a for a in (allergens if isinstance(allergens, list) else [allergens]) if a],
+        "allergens": [a for a in allergens if a] + other_all,
         "dislikes": [x.strip() for x in (form.get("dislike", "") or "").split(",") if x.strip()],
         "telegram": form.get("telegram", ""),
     }
@@ -520,13 +524,17 @@ def parse_calorie_request(form):
 def parse_budget_request(form):
     meal_types = form.getlist("meal_types") if hasattr(form, "getlist") else form.get("meal_types", [])
     excludes = form.getlist("exclude") if hasattr(form, "getlist") else form.get("exclude", [])
+    if isinstance(excludes, str):
+        excludes = [excludes] if excludes else []
+    other_ex = form.get("exclude_other", "") or ""
+    other_ex = [x.strip() for x in other_ex.split(",") if x.strip()]
     return {
         "_mode": "budget",
         "meal_types": meal_types if isinstance(meal_types, list) else [meal_types],
         "budget": int(form.get("budget_value") or form.get("budget") or 5000),
         "people": form.get("people", "1"),
         "days_b": int(form.get("days_b", 7)),
-        "excludes": [e for e in (excludes if isinstance(excludes, list) else [excludes]) if e],
+        "excludes": [e for e in excludes if e] + other_ex,
         "telegram": form.get("telegram_b") or form.get("telegram", ""),
     }
 
