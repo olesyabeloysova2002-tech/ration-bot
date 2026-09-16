@@ -73,12 +73,19 @@ def _generate_day_menu(person_kcal, meals_per_day, allergens, dislikes, recently
 
 
 def _collect_dish_ids(plan):
-    """Собрать все id блюд из плана."""
+    """Собрать все id блюд из плана. plan — это dict {'plan': [...], ...}."""
     out = []
-    for entry in plan:
+    items = plan.get("plan") if isinstance(plan, dict) else plan
+    if not items:
+        return out
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
         for m in entry.get("meals", []):
+            if not isinstance(m, dict):
+                continue
             d = m.get("dish") or {}
-            if d.get("id"):
+            if isinstance(d, dict) and d.get("id"):
                 out.append(d["id"])
     return out
 
