@@ -86,21 +86,26 @@ def health():
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    form = request.form
-    is_budget = form.get("mode") == "budget"
-    req = parse_budget_request(form) if is_budget else parse_calorie_request(form)
-    result = generate_budget_plan(req) if is_budget else generate_calorie_plan(req)
-    sent = False
-    tg = req.get("telegram","")
-    if tg and "error" not in result:
-        cid = lookup_user(tg)
-        if cid:
-            sent = send_telegram(cid, format_telegram_message(result))
-            log.info(f"Sent to {tg} (chat_id={cid}): {sent}")
-        else:
-            log.warning(f"User {tg} not in cache — must /start the bot first")
-    result["sent_to_telegram"] = sent
-    return jsonify(result)
+    try:
+        form = request.form
+        is_budget = form.get("mode") == "budget"
+        req = parse_budget_request(form) if is_budget else parse_calorie_request(form)
+        result = generate_budget_plan(req) if is_budget else generate_calorie_plan(req)
+        sent = False
+        tg = req.get("telegram","")
+        if tg and "error" not in result:
+            cid = lookup_user(tg)
+            if cid:
+                sent = send_telegram(cid, format_telegram_message(result))
+                log.info(f"Sent to {tg} (chat_id={cid}): {sent}")
+            else:
+                log.warning(f"User {tg} not in cache — must /start the bot first")
+        result["sent_to_telegram"] = sent
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        log.error(f"/generate crash: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
 def setup_webhook():
