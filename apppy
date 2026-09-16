@@ -106,6 +106,20 @@ def reroll_keyboard():
     return {"inline_keyboard": [[{"text": "🔄 Другие блюда", "callback_data": "reroll"}]]}
 
 
+def reroll_reply_keyboard():
+    """Обычная клавиатура внизу чата — видна всегда, в отличие от inline."""
+    return {
+        "keyboard": [[{"text": "🔄 Другие блюда"}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "is_persistent": True,
+    }
+
+
+def remove_keyboard():
+    return {"remove_keyboard": True}
+
+
 def generate_and_send(chat_id, req, add_reroll=True):
     """Сгенерировать план по req, отправить в Telegram, вернуть результат."""
     mode = req.get("_mode") or ("budget" if "meal_types" in req else "calorie")
@@ -116,14 +130,20 @@ def generate_and_send(chat_id, req, add_reroll=True):
     if "error" in plan:
         send_telegram(chat_id, f"⚠️ {plan['error']}")
         return plan
-    # длинное меню — без кнопки (Telegram иногда прячет inline под длинным текстом)
+    # длинное меню
     send_telegram(chat_id, format_telegram_message(plan), reply_markup=None)
-    # кнопку шлём отдельным сообщением — её 100% видно
+    # отдельное сообщение: «для новых блюд нажми кнопку внизу»
     if add_reroll:
         send_telegram(
             chat_id,
-            "👇 Хочешь другие варианты блюд? Нажми кнопку:",
-            reply_markup=reroll_keyboard(),
+            "👇 Для новых вариантов блюд нажми кнопку внизу чата ↓",
+            reply_markup=remove_keyboard(),  # убрать старую
+        )
+        # и сразу шлём постоянную клавиатуру с кнопкой
+        send_telegram(
+            chat_id,
+            "Готово 👍",
+            reply_markup=reroll_reply_keyboard(),
         )
     return plan
 
@@ -167,6 +187,7 @@ def webhook():
 
     if text.startswith("/start"):
         send_telegram(chat_id, "Привет! 👋 Бот «Индивидуальный рацион».\n\n📋 Собери меню на сайте: https://site-bb0.p.spru.io/\nКоманды: /test /menu /help")
+        send_telegram(chat_id, "Готово 👍", reply_markup=reroll_reply_keyboard())
     elif text.startswith("/test"):
         req = {"_mode":"calorie","family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":2,"budget":2000,"allergens":[],"dislikes":[]}
         plan = generate_and_send(chat_id, req, add_reroll=True)
@@ -182,9 +203,25 @@ def webhook():
             LAST_PLAN[chat_id] = plan
             _save_state()
     elif text.startswith("/help"):
-        send_telegram(chat_id, "1. Заполни форму на https://site-bb0.p.spru.io/\n2. Укажи свой @username\n3. Получи меню в Telegram\n4. Нажми 🔄 Другие блюда, если хочешь новые варианты")
+        send_telegram(chat_id, "1. Заполни форму на https://site-bb0.p.spru.io/\n2. Укажи свой @username\n3. Получи меню в Telegram\n4. Нажми 🔄 Другие блюда внизу чата, если хочешь новые варианты")
+    elif text in ("🔄 Другие блюда", "🔄 Другие блюда ", "Другие блюда"):
+        # нажатие reply-кнопки — пересоберём план, исключая уже показанные блюда
+        if chat_id in LAST_REQ:
+            send_telegram(chat_id, "🌟 Готовлю другие варианты…")
+            req = dict(LAST_REQ[chat_id])
+            old_excl = set(req.get("exclude_ids") or [])
+            if chat_id in LAST_PLAN:
+                old_excl |= set(_collect_dish_ids(LAST_PLAN[chat_id]))
+            req["exclude_ids"] = list(old_excl)
+            LAST_REQ[chat_id] = req
+            plan = generate_and_send(chat_id, req, add_reroll=True)
+            if "error" not in plan:
+                LAST_PLAN[chat_id] = plan
+                _save_state()
+        else:
+            send_telegram(chat_id, "Нет предыдущего плана — заполни форму на https://site-bb0.p.spru.io/")
     elif text:
-        send_telegram(chat_id, "Напиши /start, /test или /menu")
+        send_telegram(chat_id, "Напиши /start, /test или /menu\nКнопка «🔄 Другие блюда» внизу — для новых вариантов")
     return jsonify({"ok": True})
 
 
@@ -238,15 +275,18 @@ def generate():
         if tg and "error" not in plan:
             cid = lookup_user(tg)
             if cid:
-                # длинное меню — без кнопки (Telegram прячет inline под длинным текстом)
                 sent = send_telegram(cid, format_telegram_message(plan), reply_markup=None)
-                # кнопку шлём отдельным сообщением
+                # постоянная клавиатура с кнопкой «Другие блюда»
                 send_telegram(
                     cid,
-                    "👇 Хочешь другие варианты блюд? Нажми кнопку:",
-                    reply_markup=reroll_keyboard(),
+                    "👇 Для новых вариантов блюд нажми кнопку внизу чата ↓",
+                    reply_markup=remove_keyboard(),
                 )
-                # сохраняем для reroll
+                send_telegram(
+                    cid,
+                    "Готово 👍",
+                    reply_markup=reroll_reply_keyboard(),
+                )
                 LAST_REQ[cid] = req
                 LAST_PLAN[cid] = plan
                 _save_state()
