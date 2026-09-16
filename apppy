@@ -1,8 +1,11 @@
-"""Webhook-версия сервера: Telegram сам шлёт обновления на наш endpoint."""
-import os, sys, logging, requests
+"""Webhook-сервер: приём заявок с сайта + Telegram bot с кнопкой 'Другие блюда'."""
+import os, sys, logging, json, time
 from flask import Flask, request, jsonify
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from menu_generator import generate_calorie_plan, generate_budget_plan, format_telegram_message
+from menu_generator import (
+    generate_calorie_plan, generate_budget_plan,
+    format_telegram_message, _collect_dish_ids,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ration-bot")
@@ -15,22 +18,39 @@ def all_exceptions(e):
     log.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
     return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://ration-bot-production.up.railway.app")
-USER_CACHE = {}
+USER_CACHE = {}        # username.lower() -> chat_id
+LAST_REQ = {}          # chat_id -> last req dict (с учётом exclude_ids от reroll)
+LAST_PLAN = {}         # chat_id -> последний план (для возможного отображения)
 
 
-def send_telegram(chat_id, text):
+def send_telegram(chat_id, text, reply_markup=None):
     try:
+        payload = {"chat_id": chat_id, "text": text[:4000], "parse_mode": "Markdown"}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "Markdown"},
+            json=payload,
             timeout=10
         )
         return r.status_code == 200
     except Exception as e:
         log.error(f"send error: {e}")
         return False
+
+
+def answer_callback(callback_query_id, text=""):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text, "show_alert": False},
+            timeout=10
+        )
+    except Exception as e:
+        log.error(f"answer_callback error: {e}")
 
 
 def lookup_user(username):
@@ -44,9 +64,51 @@ def cache_user(username, chat_id):
         USER_CACHE[username.lower()] = chat_id
 
 
+def reroll_keyboard():
+    return {"inline_keyboard": [[{"text": "🔄 Другие блюда", "callback_data": "reroll"}]]}
+
+
+def generate_and_send(chat_id, req, add_reroll=True):
+    """Сгенерировать план по req, отправить в Telegram, вернуть результат."""
+    mode = req.get("_mode") or ("budget" if "meal_types" in req else "calorie")
+    if mode == "budget":
+        plan = generate_budget_plan(req)
+    else:
+        plan = generate_calorie_plan(req)
+    if "error" in plan:
+        send_telegram(chat_id, f"⚠️ {plan['error']}")
+        return plan
+    markup = reroll_keyboard() if add_reroll else None
+    send_telegram(chat_id, format_telegram_message(plan), reply_markup=markup)
+    return plan
+
+
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     upd = request.get_json(silent=True) or {}
+
+    # inline-кнопка
+    cb = upd.get("callback_query")
+    if cb:
+        cb_id = cb.get("id")
+        data = cb.get("data", "")
+        chat_id = cb.get("message", {}).get("chat", {}).get("id")
+        if data == "reroll" and chat_id in LAST_REQ:
+            answer_callback(cb_id, "Готовлю другие варианты…")
+            req = dict(LAST_REQ[chat_id])
+            # добираем exclude_ids из прошлого плана
+            old_excl = set(req.get("exclude_ids") or [])
+            if chat_id in LAST_PLAN:
+                old_excl |= set(_collect_dish_ids(LAST_PLAN[chat_id]))
+            req["exclude_ids"] = list(old_excl)
+            LAST_REQ[chat_id] = req
+            plan = generate_and_send(chat_id, req, add_reroll=True)
+            if "error" not in plan:
+                LAST_PLAN[chat_id] = plan
+        else:
+            answer_callback(cb_id, "Нет предыдущего плана")
+        return jsonify({"ok": True})
+
     msg = upd.get("message")
     if not msg:
         return jsonify({"ok": True})
@@ -56,16 +118,23 @@ def webhook():
     if username:
         cache_user(username, chat_id)
     log.info(f"msg from @{username} ({chat_id}): {text}")
+
     if text.startswith("/start"):
         send_telegram(chat_id, "Привет! 👋 Бот «Индивидуальный рацион».\n\n📋 Собери меню на сайте: https://site-bb0.p.spru.io/\nКоманды: /test /menu /help")
     elif text.startswith("/test"):
-        r = generate_calorie_plan({"family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":2,"budget":2000,"allergens":[],"dislikes":[]})
-        send_telegram(chat_id, format_telegram_message(r))
+        req = {"_mode":"calorie","family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":2,"budget":2000,"allergens":[],"dislikes":[]}
+        plan = generate_and_send(chat_id, req, add_reroll=True)
+        if "error" not in plan:
+            LAST_REQ[chat_id] = req
+            LAST_PLAN[chat_id] = plan
     elif text.startswith("/menu"):
-        r = generate_calorie_plan({"family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":1,"budget":None,"allergens":[],"dislikes":[]})
-        send_telegram(chat_id, format_telegram_message(r))
+        req = {"_mode":"calorie","family_size":1,"persons":[{"kcal":"1500","meals":"3"}],"days":1,"budget":None,"allergens":[],"dislikes":[]}
+        plan = generate_and_send(chat_id, req, add_reroll=True)
+        if "error" not in plan:
+            LAST_REQ[chat_id] = req
+            LAST_PLAN[chat_id] = plan
     elif text.startswith("/help"):
-        send_telegram(chat_id, "1. Заполни форму на https://site-bb0.p.spru.io/\n2. Укажи свой @username\n3. Получи меню в Telegram")
+        send_telegram(chat_id, "1. Заполни форму на https://site-bb0.p.spru.io/\n2. Укажи свой @username\n3. Получи меню в Telegram\n4. Нажми 🔄 Другие блюда, если хочешь новые варианты")
     elif text:
         send_telegram(chat_id, "Напиши /start, /test или /menu")
     return jsonify({"ok": True})
@@ -77,18 +146,36 @@ def parse_calorie_request(form):
     for i in range(family_size):
         persons.append({"kcal": form.get(f"person_{i}_kcal") or "1500", "meals": form.get(f"person_{i}_meals") or "5"})
     allergens = form.getlist("allergens") if hasattr(form, "getlist") else form.get("allergens", "")
-    return {"family_size":family_size,"persons":persons,"days":int(form.get("days",7)),"budget":int(form.get("budget_value") or 0) or None,"allergens":[a for a in (allergens if isinstance(allergens,list) else [allergens]) if a],"dislikes":[x.strip() for x in (form.get("dislike","") or "").split(",") if x.strip()],"telegram":form.get("telegram","")}
+    req = {
+        "_mode": "calorie",
+        "family_size": family_size,
+        "persons": persons,
+        "days": int(form.get("days", 7)),
+        "budget": int(form.get("budget_value") or 0) or None,
+        "allergens": [a for a in (allergens if isinstance(allergens, list) else [allergens]) if a],
+        "dislikes": [x.strip() for x in (form.get("dislike", "") or "").split(",") if x.strip()],
+        "telegram": form.get("telegram", ""),
+    }
+    return req
 
 
 def parse_budget_request(form):
     meal_types = form.getlist("meal_types") if hasattr(form, "getlist") else form.get("meal_types", [])
     excludes = form.getlist("exclude") if hasattr(form, "getlist") else form.get("exclude", [])
-    return {"meal_types":meal_types if isinstance(meal_types,list) else [meal_types],"budget":int(form.get("budget_value") or form.get("budget") or 5000),"people":form.get("people","1"),"days_b":int(form.get("days_b",7)),"excludes":[e for e in (excludes if isinstance(excludes,list) else [excludes]) if e],"telegram":form.get("telegram_b") or form.get("telegram","")}
+    return {
+        "_mode": "budget",
+        "meal_types": meal_types if isinstance(meal_types, list) else [meal_types],
+        "budget": int(form.get("budget_value") or form.get("budget") or 5000),
+        "people": form.get("people", "1"),
+        "days_b": int(form.get("days_b", 7)),
+        "excludes": [e for e in (excludes if isinstance(excludes, list) else [excludes]) if e],
+        "telegram": form.get("telegram_b") or form.get("telegram", ""),
+    }
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok","bot":bool(BOT_TOKEN),"users":len(USER_CACHE)})
+    return jsonify({"status": "ok", "bot": bool(BOT_TOKEN), "users": len(USER_CACHE), "plans": len(LAST_PLAN)})
 
 
 @app.route("/generate", methods=["POST"])
@@ -97,18 +184,23 @@ def generate():
         form = request.form
         is_budget = form.get("mode") == "budget"
         req = parse_budget_request(form) if is_budget else parse_calorie_request(form)
-        result = generate_budget_plan(req) if is_budget else generate_calorie_plan(req)
+        plan = generate_budget_plan(req) if is_budget else generate_calorie_plan(req)
         sent = False
-        tg = req.get("telegram","")
-        if tg and "error" not in result:
+        tg = req.get("telegram", "")
+        if tg and "error" not in plan:
             cid = lookup_user(tg)
             if cid:
-                sent = send_telegram(cid, format_telegram_message(result))
+                # отправляем с кнопкой reroll
+                markup = reroll_keyboard()
+                sent = send_telegram(cid, format_telegram_message(plan), reply_markup=markup)
+                # сохраняем для reroll
+                LAST_REQ[cid] = req
+                LAST_PLAN[cid] = plan
                 log.info(f"Sent to {tg} (chat_id={cid}): {sent}")
             else:
                 log.warning(f"User {tg} not in cache — must /start the bot first")
-        result["sent_to_telegram"] = sent
-        return jsonify(result)
+        plan["sent_to_telegram"] = sent
+        return jsonify(plan)
     except Exception as e:
         import traceback
         log.error(f"/generate crash: {e}\n{traceback.format_exc()}")
@@ -123,7 +215,8 @@ def setup_webhook():
         url = f"{PUBLIC_URL}/webhook/{BOT_TOKEN}"
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-            json={"url": url, "drop_pending_updates": True, "allowed_updates": ["message"]},
+            json={"url": url, "drop_pending_updates": True,
+                  "allowed_updates": ["message", "callback_query"]},
             timeout=10
         )
         log.info(f"setWebhook: {r.json()}")
