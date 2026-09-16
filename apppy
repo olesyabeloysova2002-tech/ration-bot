@@ -1,4 +1,4 @@
-"""Webhook-сервер: приём заявок с сайта + Telegram bot с кнопкой 'Другие блюда'."""
+"""Webhook-сервер: приём заявок с сайта + Telegram bot. v2 — text command 'ещё' for reroll."""
 import os, sys, logging, json, time
 import requests
 from flask import Flask, request, jsonify
